@@ -45,6 +45,7 @@ async def health():
             "model": "models/gemini-embedding-001",
             "content": {"parts": [{"text": "test"}]},
             "taskType": "RETRIEVAL_QUERY",
+            "outputDimensionality": 768,
         }
         _resp = _httpx.post(_url, json=_payload, params={"key": _key}, timeout=10)
         _vals = _resp.json().get("embedding", {}).get("values", []) if _resp.status_code == 200 else []

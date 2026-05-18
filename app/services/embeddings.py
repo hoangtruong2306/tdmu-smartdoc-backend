@@ -3,7 +3,8 @@ import asyncio
 import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-EMBED_MODEL = "gemini-embedding-001"  # 3072 dims
+EMBED_MODEL = "gemini-embedding-001"
+OUTPUT_DIMS = 768  # Matryoshka truncation → fits Supabase vector(768) + HNSW index
 BATCH_SIZE = 10
 _API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 
@@ -22,6 +23,7 @@ def _embed_batch_sync(texts: list[str]) -> list[list[float]]:
                 "model": f"models/{EMBED_MODEL}",
                 "content": {"parts": [{"text": t}]},
                 "taskType": "RETRIEVAL_DOCUMENT",
+                "outputDimensionality": OUTPUT_DIMS,
             }
             for t in texts
         ]
@@ -48,6 +50,7 @@ def _embed_query_sync(text: str) -> list[float]:
         "model": f"models/{EMBED_MODEL}",
         "content": {"parts": [{"text": text}]},
         "taskType": "RETRIEVAL_QUERY",
+        "outputDimensionality": OUTPUT_DIMS,
     }
     resp = httpx.post(url, json=payload, params={"key": _get_key()}, timeout=30)
     resp.raise_for_status()

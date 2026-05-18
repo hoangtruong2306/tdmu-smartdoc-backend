@@ -40,7 +40,7 @@ create table if not exists chunks (
   user_id     text not null,
   content     text not null,
   page_num    int  default 0,
-  embedding   vector(3072),
+  embedding   vector(768),
   created_at  timestamptz default now()
 );
 
