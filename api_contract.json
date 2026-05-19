@@ -1,0 +1,53 @@
+{
+  "version": "1.0.0",
+  "base_url": "https://<railway-app>.up.railway.app",
+  "auth": "Bearer <Firebase ID Token> — gửi trong header Authorization",
+  "endpoints": [
+    {
+      "method": "GET",
+      "path": "/ping",
+      "auth": false,
+      "response": { "status": "ok", "service": "TDMU SmartDoc API" }
+    },
+    {
+      "method": "POST",
+      "path": "/documents/upload",
+      "auth": true,
+      "content_type": "multipart/form-data",
+      "fields": { "file": "binary (PDF / TXT, tối đa 20 MB)" },
+      "response": {
+        "document_id": "uuid",
+        "title": "string",
+        "page_count": "int",
+        "chunks_count": "int"
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/documents",
+      "auth": true,
+      "response": [
+        {
+          "id": "uuid",
+          "title": "string",
+          "page_count": "int",
+          "type": "pdf | txt",
+          "created_at": "ISO8601"
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/chat/ask",
+      "auth": true,
+      "body": {
+        "message": "string (câu hỏi tiếng Việt)",
+        "doc_id": "uuid | null (null = tìm toàn bộ tài liệu)"
+      },
+      "response": {
+        "answer": "string (trả lời tiếng Việt từ Gemini)",
+        "citations": [{ "label": "Trang", "value": "string" }]
+      }
+    }
+  ]
+}
