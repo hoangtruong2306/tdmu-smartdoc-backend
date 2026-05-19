@@ -36,7 +36,8 @@ class HistoryMessage(BaseModel):
 class AskRequest(BaseModel):
     message: str
     doc_id: Optional[str] = None
-    history: List[HistoryMessage] = []   # 👈 thêm field history
+    notebook_id: Optional[str] = None
+    history: List[HistoryMessage] = []
 
 
 # ── System prompt chuẩn ───────────────────────────────────────────────────────
@@ -66,12 +67,12 @@ async def ask(req: AskRequest, user: dict = Depends(get_current_user)):
     if not question:
         raise HTTPException(400, "Câu hỏi không được để trống")
 
-    doc_id = req.doc_id or "all"
     uid = user["uid"]
+    cache_key = req.notebook_id or req.doc_id or "all"
 
     # 1. Kiểm tra cache (chỉ cache khi không có history để tránh sai context)
     if not req.history:
-        cached = get_cached(question, doc_id)
+        cached = get_cached(question, cache_key)
         if cached:
             return cached
 
@@ -82,7 +83,7 @@ async def ask(req: AskRequest, user: dict = Depends(get_current_user)):
         print(f"[ask] Embed error: {e}")
         return _mock_response()
 
-    # 3. Tìm chunks qua pgvector
+    # 3. Tìm chunks qua pgvector (ưu tiên: notebook > doc > tất cả)
     sb = get_supabase()
     try:
         rpc_params: dict = {
@@ -90,10 +91,15 @@ async def ask(req: AskRequest, user: dict = Depends(get_current_user)):
             "match_count": TOP_K,
             "user_id_filter": uid,
         }
-        if doc_id != "all":
-            rpc_params["doc_id_filter"] = doc_id
+        if req.notebook_id:
+            rpc_name = "match_chunks_by_notebook"
+            rpc_params["notebook_id_filter"] = req.notebook_id
+        elif req.doc_id:
+            rpc_name = "match_chunks_by_doc"
+            rpc_params["doc_id_filter"] = req.doc_id
+        else:
+            rpc_name = "match_chunks"
 
-        rpc_name = "match_chunks" if doc_id == "all" else "match_chunks_by_doc"
         res = await asyncio.to_thread(
             lambda: sb.rpc(rpc_name, rpc_params).execute()
         )
@@ -174,7 +180,7 @@ async def ask(req: AskRequest, user: dict = Depends(get_current_user)):
 
     # Cache chỉ khi không có history (câu hỏi độc lập)
     if not req.history:
-        set_cached(question, doc_id, result)
+        set_cached(question, cache_key, result)
 
     return result
 
