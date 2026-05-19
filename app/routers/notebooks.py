@@ -26,11 +26,13 @@ def _is_valid_uuid(val: str) -> bool:
 class NotebookCreate(BaseModel):
     name: str
     color: Optional[str] = "#6750A4"
+    icon: Optional[str] = "school"
 
 
 class NotebookUpdate(BaseModel):
     name: Optional[str] = None
     color: Optional[str] = None
+    icon: Optional[str] = None
 
 
 @router.get("")
@@ -39,7 +41,7 @@ async def list_notebooks(user: dict = Depends(get_current_user)):
     sb = get_supabase()
     res = await asyncio.to_thread(
         lambda: sb.table("notebooks")
-        .select("id, name, color, summary, suggestions, created_at, updated_at")
+        .select("id, name, color, icon, summary, suggestions, created_at, updated_at")
         .eq("user_id", uid)
         .order("updated_at", desc=True)
         .execute()
@@ -61,6 +63,7 @@ async def create_notebook(body: NotebookCreate, user: dict = Depends(get_current
             "user_id": uid,
             "name": body.name.strip(),
             "color": body.color or "#6750A4",
+            "icon": body.icon or "school",
         }).execute()
     )
     data = res.data or []
@@ -76,7 +79,7 @@ async def update_notebook(
     user: dict = Depends(get_current_user),
 ):
     # Bug 5 fix: validate ít nhất 1 field được cập nhật
-    if body.name is None and body.color is None:
+    if body.name is None and body.color is None and body.icon is None:
         raise HTTPException(400, "Cần cung cấp ít nhất name hoặc color để cập nhật")
 
     # Bug 6 fix: validate UUID format
@@ -102,6 +105,8 @@ async def update_notebook(
         updates["name"] = body.name.strip()
     if body.color is not None:
         updates["color"] = body.color
+    if body.icon is not None:
+        updates["icon"] = body.icon
 
     res = await asyncio.to_thread(
         lambda: sb.table("notebooks")

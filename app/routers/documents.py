@@ -27,12 +27,14 @@ async def _embed_and_store(
     doc_id: str,
     uid: str,
     chunks,
-    ext: str,
     notebook_id: Optional[str] = None,
 ):
-    """Background task: embed chunks và lưu vào Supabase."""
+    """Background task: embed chunks và lưu vào Supabase.
+
+    Cập nhật status='failed' nếu lỗi để UI biết và user có thể upload lại.
+    """
+    sb = get_supabase()
     try:
-        sb = get_supabase()
         texts = [c.content for c in chunks]
         embeddings = await embed_texts(texts)
 
@@ -65,6 +67,15 @@ async def _embed_and_store(
 
     except Exception as e:
         print(f"[embed_and_store] Lỗi doc {doc_id}: {e}")
+        try:
+            await asyncio.to_thread(
+                lambda: sb.table("documents")
+                .update({"status": "failed"})
+                .eq("id", doc_id)
+                .execute()
+            )
+        except Exception as e2:
+            print(f"[embed_and_store] Không thể cập nhật status failed cho {doc_id}: {e2}")
 
 
 @router.post("/upload")
@@ -84,12 +95,10 @@ async def upload_document(
 
     uid = user["uid"]
 
-    # Bug 6 fix: validate UUID format
     if notebook_id is not None:
         if not _is_valid_uuid(notebook_id):
             raise HTTPException(400, "notebook_id không hợp lệ")
 
-        # Bug 2 fix (Security): kiểm tra notebook thuộc về user hiện tại
         sb = get_supabase()
         nb_check = await asyncio.to_thread(
             lambda: sb.table("notebooks")
@@ -120,7 +129,7 @@ async def upload_document(
         }).execute()
     )
 
-    background_tasks.add_task(_embed_and_store, doc_id, uid, chunks, ext, notebook_id)
+    background_tasks.add_task(_embed_and_store, doc_id, uid, chunks, notebook_id)
 
     return {
         "document_id": doc_id,
