@@ -1,6 +1,8 @@
+import json as _json
 import os
 import asyncio
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import List, Optional
 from google import genai
@@ -177,6 +179,110 @@ async def ask(req: AskRequest, user: dict = Depends(get_current_user)):
         set_cached(uid, question, source_key, result)
 
     return result
+
+
+@router.post("/stream")
+async def ask_stream(req: AskRequest, user: dict = Depends(get_current_user)):
+    """SSE streaming endpoint.
+
+    Headers được gửi NGAY LẬP TỨC sau khi auth xong — mọi I/O nặng
+    (embed, pgvector, Gemini) đều nằm bên trong generator để tránh
+    Flutter timeout trước khi nhận được headers.
+    """
+    question = req.message.strip()
+    uid = user["uid"]
+
+    _sse_headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+
+    if not question:
+        async def _empty():
+            yield f"data: {_json.dumps({'type':'error','message':'Câu hỏi không được để trống.'})}\n\n"
+            yield f"data: {_json.dumps({'type':'done','full_text':''})}\n\n"
+        return StreamingResponse(_empty(), media_type="text/event-stream", headers=_sse_headers)
+
+    async def token_stream():
+        # ── 1. Báo hiệu đã kết nối → Flutter giữ typing indicator ──────────
+        yield f"data: {_json.dumps({'type':'processing'})}\n\n"
+
+        # ── 2. Embed câu hỏi ─────────────────────────────────────────────────
+        try:
+            q_embedding = await embed_query(question)
+        except Exception as e:
+            print(f"[stream] Embed error: {e}")
+            err = "Lỗi xử lý câu hỏi. Vui lòng thử lại."
+            yield f"data: {_json.dumps({'type':'token','text':err})}\n\n"
+            yield f"data: {_json.dumps({'type':'done','full_text':err})}\n\n"
+            return
+
+        # keep-alive giữa embed và Supabase
+        yield f"data: {_json.dumps({'type':'ping'})}\n\n"
+
+        # ── 3. Tìm chunks pgvector ────────────────────────────────────────────
+        sb = get_supabase()
+        rpc_name = "match_chunks"
+        rpc_params: dict = {
+            "query_embedding": q_embedding,
+            "match_count": TOP_K,
+            "user_id_filter": uid,
+        }
+        if req.notebook_id:
+            rpc_name = "match_chunks_by_notebook"
+            rpc_params["notebook_id_filter"] = req.notebook_id
+        elif req.doc_id:
+            rpc_name = "match_chunks_by_doc"
+            rpc_params["doc_id_filter"] = req.doc_id
+
+        try:
+            res = await asyncio.to_thread(lambda: sb.rpc(rpc_name, rpc_params).execute())
+            chunks = res.data or []
+        except Exception as e:
+            print(f"[stream] Supabase error ({rpc_name}): {e}")
+            chunks = []
+
+        # ── 4. Gửi citations ─────────────────────────────────────────────────
+        context_parts = [f"[{i+1}] {c.get('content', '')}" for i, c in enumerate(chunks)]
+        context = "\n---\n".join(context_parts)[:MAX_CONTEXT_CHARS]
+        citations = [
+            {
+                "label": f"Nguồn {i+1}",
+                "value": str(c.get("page_num", "?")),
+                "snippet": c.get("content", "")[:200],
+                "filename": c.get("filename", ""),
+            }
+            for i, c in enumerate(chunks)
+        ]
+        yield f"data: {_json.dumps({'type':'citations','citations':citations})}\n\n"
+
+        # ── 5. Gọi Gemini stream ──────────────────────────────────────────────
+        has_specific = bool(req.notebook_id or req.doc_id)
+        system_prompt = _build_system_prompt(context, has_specific)
+        gemini_history = _build_gemini_history(req.history)
+        config = genai.types.GenerateContentConfig(system_instruction=system_prompt)
+
+        full_text = ""
+        try:
+            chat_session = _client.chats.create(
+                model=GENERATE_MODEL,
+                history=gemini_history,
+                config=config,
+            )
+            stream = await asyncio.to_thread(
+                lambda: chat_session.send_message_stream(question)
+            )
+            for chunk in stream:
+                token = chunk.text or ""
+                if token:
+                    full_text += token
+                    yield f"data: {_json.dumps({'type':'token','text':token})}\n\n"
+        except Exception as e:
+            print(f"[stream] Gemini error: {e}")
+            if not full_text:
+                full_text = "Xin lỗi, có lỗi xảy ra. Vui lòng thử lại."
+                yield f"data: {_json.dumps({'type':'token','text':full_text})}\n\n"
+
+        yield f"data: {_json.dumps({'type':'done','full_text':full_text})}\n\n"
+
+    return StreamingResponse(token_stream(), media_type="text/event-stream", headers=_sse_headers)
 
 
 async def _call_gemini(
