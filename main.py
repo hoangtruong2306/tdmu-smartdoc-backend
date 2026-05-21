@@ -28,7 +28,7 @@ app.include_router(chat.router, prefix="/chat", tags=["chat"])
 app.include_router(notebooks.router, prefix="/notebooks", tags=["notebooks"])
 
 
-@app.get("/ping")
+@app.api_route("/ping", methods=["GET", "HEAD"])
 def ping():
     return {"status": "ok", "service": "TDMU SmartDoc API"}
 
