@@ -28,9 +28,10 @@ import asyncio
 import json
 import os
 import re
-from fastapi import APIRouter, Depends, HTTPException
+import uuid
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
-from typing import Optional
+from typing import List, Optional
 from google import genai
 
 from app.auth import get_current_user
@@ -112,6 +113,24 @@ class QuizRequest(BaseModel):
     notebook_id: str
     num_questions: int = 5
     difficulty: Optional[str] = "medium"   # "easy" | "medium" | "hard"
+
+
+# ── Models cho Save / History ──────────────────────────────────────────────────
+
+class QuizAnswerItem(BaseModel):
+    """Đáp án của 1 câu: index câu + letter người dùng chọn."""
+    question_index: int
+    user_answer: Optional[str] = None   # None = bỏ qua không chọn
+
+
+class QuizSaveRequest(BaseModel):
+    """Payload gửi lên sau khi người dùng hoàn thành bài quiz."""
+    notebook_id:   Optional[str] = None
+    notebook_name: str
+    difficulty:    str
+    is_mock:       bool
+    questions:     List[dict]         # danh sách câu hỏi đầy đủ
+    answers:       List[QuizAnswerItem]  # đáp án từng câu
 
 
 # ── Helper: lấy chunks từ Supabase ───────────────────────────────────────────
@@ -311,3 +330,171 @@ async def generate_quiz(
     mock["notebook_name"] = notebook_name
     mock["is_mock"] = True
     return mock
+
+
+# ── POST /quiz/save — Lưu kết quả sau khi hoàn thành bài ─────────────────────
+#
+# LUỒNG:
+#   1. Tính correct_count bằng cách so sánh user_answer với correct
+#   2. Tạo record trong quiz_sessions (1 row)
+#   3. Bulk insert tất cả câu hỏi vào quiz_questions
+#   4. Trả session_id để Flutter dùng navigate sang màn hình review
+#
+# TÍNH ĐIỂM (server-side để tránh giả mạo):
+#   Duyệt từng QuizAnswerItem, lookup câu tương ứng qua question_index,
+#   so sánh user_answer == correct → đếm số đúng
+#
+@router.post("/save")
+async def save_quiz_session(
+    req: QuizSaveRequest,
+    user: dict = Depends(get_current_user),
+):
+    sb  = get_supabase()
+    uid = user["uid"]
+
+    # ── Tính điểm phía server ─────────────────────────────────────────────────
+    # Map question_index → correct để lookup O(1)
+    correct_map: dict[int, str] = {
+        i: q.get("correct", "")
+        for i, q in enumerate(req.questions)
+    }
+    correct_count = sum(
+        1 for ans in req.answers
+        if ans.user_answer and ans.user_answer == correct_map.get(ans.question_index, "")
+    )
+    total      = len(req.questions)
+    score_pct  = round(correct_count / total * 100) if total > 0 else 0
+
+    # ── Tạo session record ────────────────────────────────────────────────────
+    session_id = str(uuid.uuid4())
+    try:
+        await asyncio.to_thread(
+            lambda: sb.table("quiz_sessions").insert({
+                "id":              session_id,
+                "user_id":         uid,
+                "notebook_id":     req.notebook_id,      # nullable
+                "notebook_name":   req.notebook_name,
+                "difficulty":      req.difficulty,
+                "total_questions": total,
+                "correct_count":   correct_count,
+                "score_pct":       score_pct,
+                "is_mock":         req.is_mock,
+            }).execute()
+        )
+    except Exception as e:
+        print(f"[quiz/save] Lỗi tạo session: {e}")
+        raise HTTPException(500, "Không thể lưu kết quả quiz")
+
+    # ── Bulk insert từng câu hỏi ──────────────────────────────────────────────
+    # Build answer_map: question_index → user_answer để lookup O(1)
+    answer_map: dict[int, Optional[str]] = {
+        a.question_index: a.user_answer for a in req.answers
+    }
+    rows = []
+    for i, q in enumerate(req.questions):
+        user_ans   = answer_map.get(i)
+        is_correct = bool(user_ans and user_ans == q.get("correct", ""))
+        rows.append({
+            "session_id":      session_id,
+            "question_index":  i,
+            "question":        q.get("question", ""),
+            "options":         q.get("options", []),    # list → JSONB
+            "correct":         q.get("correct", ""),
+            "explanation":     q.get("explanation", ""),
+            "user_answer":     user_ans,
+            "is_correct":      is_correct,
+        })
+
+    try:
+        # Batch insert tất cả câu hỏi (1 round-trip)
+        await asyncio.to_thread(
+            lambda: sb.table("quiz_questions").insert(rows).execute()
+        )
+    except Exception as e:
+        print(f"[quiz/save] Lỗi insert quiz_questions: {e}")
+        # Không raise — session đã được lưu, chỉ mất chi tiết câu hỏi
+
+    return {"session_id": session_id, "score_pct": score_pct, "correct_count": correct_count}
+
+
+# ── GET /quiz/history — Danh sách các lần làm quiz ───────────────────────────
+#
+# PARAMS:
+#   notebook_id (optional) — lọc theo notebook, nếu None → lấy tất cả
+#   limit (default 20)     — số session tối đa trả về
+#
+# SORT: created_at DESC (mới nhất đầu tiên)
+#
+@router.get("/history")
+async def get_quiz_history(
+    notebook_id: Optional[str] = Query(None),
+    limit:       int           = Query(20, le=50),
+    user: dict = Depends(get_current_user),
+):
+    sb  = get_supabase()
+    uid = user["uid"]
+
+    try:
+        query = (
+            sb.table("quiz_sessions")
+              .select("id, notebook_id, notebook_name, difficulty, total_questions, correct_count, score_pct, is_mock, created_at")
+              .eq("user_id", uid)
+              .order("created_at", desc=True)
+              .limit(limit)
+        )
+        if notebook_id:
+            query = query.eq("notebook_id", notebook_id)
+
+        res = await asyncio.to_thread(lambda: query.execute())
+        return res.data or []
+    except Exception as e:
+        print(f"[quiz/history] Lỗi: {e}")
+        raise HTTPException(500, "Không thể tải lịch sử")
+
+
+# ── GET /quiz/session/{session_id} — Chi tiết 1 session ──────────────────────
+#
+# OWNERSHIP CHECK: kiểm tra session thuộc user trước khi trả dữ liệu
+# Trả về session info + toàn bộ quiz_questions (kể cả đáp án đúng/sai)
+#
+@router.get("/session/{session_id}")
+async def get_quiz_session_detail(
+    session_id: str,
+    user: dict = Depends(get_current_user),
+):
+    sb  = get_supabase()
+    uid = user["uid"]
+
+    # Lấy session (kèm ownership check)
+    try:
+        session_res = await asyncio.to_thread(
+            lambda: sb.table("quiz_sessions")
+                .select("*")
+                .eq("id", session_id)
+                .eq("user_id", uid)    # ownership isolation
+                .execute()
+        )
+        if not session_res.data:
+            raise HTTPException(404, "Không tìm thấy session")
+        session = session_res.data[0]
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[quiz/session] Lỗi lấy session {session_id}: {e}")
+        raise HTTPException(500, "Lỗi kết nối database")
+
+    # Lấy danh sách câu hỏi, sắp xếp theo thứ tự
+    try:
+        q_res = await asyncio.to_thread(
+            lambda: sb.table("quiz_questions")
+                .select("*")
+                .eq("session_id", session_id)
+                .order("question_index")
+                .execute()
+        )
+        questions = q_res.data or []
+    except Exception as e:
+        print(f"[quiz/session] Lỗi lấy questions: {e}")
+        questions = []
+
+    return {**session, "questions": questions}
