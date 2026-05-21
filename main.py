@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from app.routers import documents, chat, notebooks
+from app.routers import documents, chat, notebooks, quiz
 
 app = FastAPI(
     title="TDMU SmartDoc API",
@@ -26,6 +26,7 @@ app.add_middleware(
 app.include_router(documents.router, prefix="/documents", tags=["documents"])
 app.include_router(chat.router, prefix="/chat", tags=["chat"])
 app.include_router(notebooks.router, prefix="/notebooks", tags=["notebooks"])
+app.include_router(quiz.router, prefix="/quiz", tags=["quiz"])
 
 
 @app.api_route("/ping", methods=["GET", "HEAD"])
