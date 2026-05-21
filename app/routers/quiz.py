@@ -129,20 +129,26 @@ async def _get_notebook_context(
     sb,
     limit: int = 15,
 ) -> str:
+    """Lấy chunks từ Supabase theo notebook_id, sắp xếp theo page_num.
+
+    Bảng chunks có các cột: document_id, user_id, content, page_num,
+    embedding, notebook_id — KHÔNG có chunk_index.
+    Dùng page_num để sắp xếp nội dung theo thứ tự trang tài liệu.
+    """
     try:
         res = await asyncio.to_thread(
             lambda: sb.table("chunks")
-                .select("content, chunk_index")
+                .select("content, page_num")      # chỉ lấy 2 trường cần thiết
                 .eq("notebook_id", notebook_id)
                 .eq("user_id", user_id)
-                .order("chunk_index")           # giữ thứ tự logic
-                .limit(limit)                   # tránh quá nhiều token
+                .order("page_num")                # sắp xếp theo trang (tồn tại trong schema)
+                .limit(limit)                     # giới hạn token Gemini
                 .execute()
         )
         chunks = res.data or []
         if not chunks:
             return ""
-        # Nối chunks với dấu phân cách, cắt tối đa 5000 ký tự
+        # Nối chunks với dấu phân cách, cắt tối đa 5000 ký tự tránh vượt context
         return "\n\n".join(c["content"] for c in chunks)[:5000]
     except Exception as e:
         print(f"[quiz] Lỗi lấy chunks: {e}")
