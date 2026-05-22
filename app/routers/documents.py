@@ -250,3 +250,55 @@ async def assign_documents_to_notebook(
         "assigned": assigned,
         "notebook_id": body.notebook_id,
     }
+
+
+# ── Remove documents from notebook (keep file, just unassign) ────────────────
+
+class UnassignDocumentsRequest(BaseModel):
+    doc_ids: List[str]
+
+
+@router.post("/unassign")
+async def unassign_documents_from_notebook(
+    body: UnassignDocumentsRequest,
+    user: dict = Depends(get_current_user),
+):
+    """Gỡ tài liệu khỏi notebook (đặt notebook_id = NULL).
+
+    File vẫn còn trong hệ thống, chỉ không còn thuộc notebook nào.
+    User có thể gán lại vào notebook khác sau.
+    """
+    uid = user["uid"]
+
+    if not body.doc_ids:
+        raise HTTPException(400, "doc_ids không được rỗng")
+
+    for doc_id in body.doc_ids:
+        if not _is_valid_uuid(doc_id):
+            raise HTTPException(400, f"doc_id không hợp lệ: {doc_id}")
+
+    sb = get_supabase()
+    unassigned: List[str] = []
+
+    for doc_id in body.doc_ids:
+        result = await asyncio.to_thread(
+            lambda d=doc_id: sb.table("documents")
+            .update({"notebook_id": None})
+            .eq("id", d)
+            .eq("user_id", uid)
+            .execute()
+        )
+        if result.data:
+            unassigned.append(doc_id)
+
+    # Chunks cũng cần unassign để tránh lọt vào RAG search của notebook cũ
+    for doc_id in unassigned:
+        await asyncio.to_thread(
+            lambda d=doc_id: sb.table("chunks")
+            .update({"notebook_id": None})
+            .eq("document_id", d)
+            .eq("user_id", uid)
+            .execute()
+        )
+
+    return {"unassigned_count": len(unassigned), "unassigned": unassigned}
