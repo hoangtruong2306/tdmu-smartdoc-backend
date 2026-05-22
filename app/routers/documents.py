@@ -302,3 +302,82 @@ async def unassign_documents_from_notebook(
         )
 
     return {"unassigned_count": len(unassigned), "unassigned": unassigned}
+
+
+# ── Delete endpoints ──────────────────────────────────────────────────────────
+
+async def _delete_document(sb, doc_id: str, uid: str) -> bool:
+    """Xóa 1 document + toàn bộ chunks của nó khỏi Supabase.
+
+    Xóa chunks trước (FK) rồi mới xóa document để tránh constraint lỗi.
+    Chỉ cho phép xóa documents thuộc chính user (bảo mật).
+    Trả về True nếu document tồn tại và đã xóa thành công.
+    """
+    # Xóa chunks trước
+    await asyncio.to_thread(
+        lambda: sb.table("chunks")
+        .delete()
+        .eq("document_id", doc_id)
+        .eq("user_id", uid)
+        .execute()
+    )
+    # Xóa document
+    result = await asyncio.to_thread(
+        lambda: sb.table("documents")
+        .delete()
+        .eq("id", doc_id)
+        .eq("user_id", uid)
+        .execute()
+    )
+    return bool(result.data)
+
+
+class BatchDeleteRequest(BaseModel):
+    ids: List[str]
+
+
+@router.delete("/batch")
+async def delete_documents_batch(
+    body: BatchDeleteRequest,
+    user: dict = Depends(get_current_user),
+):
+    """Xóa nhiều tài liệu cùng lúc.
+
+    PHẢI đặt trước /{doc_id} để FastAPI không nhầm "batch" là doc_id.
+    Trả về danh sách id đã xóa thành công.
+    Các id không hợp lệ hoặc không thuộc user sẽ bị bỏ qua.
+    """
+    if not body.ids:
+        raise HTTPException(400, "ids không được rỗng")
+
+    uid     = user["uid"]
+    sb      = get_supabase()
+    deleted = []
+
+    for doc_id in body.ids:
+        if not _is_valid_uuid(doc_id):
+            continue
+        ok = await _delete_document(sb, doc_id, uid)
+        if ok:
+            deleted.append(doc_id)
+
+    return {"deleted_count": len(deleted), "deleted": deleted}
+
+
+@router.delete("/{doc_id}")
+async def delete_document(
+    doc_id: str,
+    user: dict = Depends(get_current_user),
+):
+    """Xóa một tài liệu và toàn bộ chunks của nó."""
+    if not _is_valid_uuid(doc_id):
+        raise HTTPException(400, "doc_id không hợp lệ")
+
+    uid = user["uid"]
+    sb  = get_supabase()
+    ok  = await _delete_document(sb, doc_id, uid)
+
+    if not ok:
+        raise HTTPException(404, "Tài liệu không tồn tại hoặc không có quyền xóa")
+
+    return {"deleted": doc_id}
