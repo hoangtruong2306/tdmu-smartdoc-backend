@@ -1,7 +1,8 @@
 import asyncio
 import uuid
-from typing import Optional
+from typing import List, Optional
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile
+from pydantic import BaseModel
 
 from app.auth import get_current_user
 from app.services.database import get_supabase
@@ -27,10 +28,11 @@ async def _embed_and_store(
     doc_id: str,
     uid: str,
     chunks,
-    notebook_id: Optional[str] = None,
+    notebook_id: str,  # REQUIRED — document phải thuộc notebook
 ):
     """Background task: embed chunks và lưu vào Supabase.
 
+    Document embedding và chunks sẽ được gắn với notebook_id.
     Cập nhật status='failed' nếu lỗi để UI biết và user có thể upload lại.
     """
     sb = get_supabase()
@@ -82,9 +84,13 @@ async def _embed_and_store(
 async def upload_document(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
-    notebook_id: Optional[str] = Form(None),
+    notebook_id: str = Form(...),  # REQUIRED — mỗi file phải thuộc 1 notebook
     user: dict = Depends(get_current_user),
 ):
+    """Upload PDF/Slide vào notebook cụ thể.
+
+    notebook_id REQUIRED — đảm bảo document isolation.
+    """
     ext = (file.filename or "").rsplit(".", 1)[-1].lower()
     if ext not in ALLOWED_TYPES:
         raise HTTPException(400, f"Chỉ hỗ trợ: {', '.join(ALLOWED_TYPES)}")
@@ -95,28 +101,29 @@ async def upload_document(
 
     uid = user["uid"]
 
-    if notebook_id is not None:
-        if not _is_valid_uuid(notebook_id):
-            raise HTTPException(400, "notebook_id không hợp lệ")
+    # Validate notebook_id format
+    if not _is_valid_uuid(notebook_id):
+        raise HTTPException(400, "notebook_id không hợp lệ (phải là UUID)")
 
-        sb = get_supabase()
-        nb_check = await asyncio.to_thread(
-            lambda: sb.table("notebooks")
-            .select("id")
-            .eq("id", notebook_id)
-            .eq("user_id", uid)
-            .execute()
-        )
-        if not nb_check.data:
-            raise HTTPException(403, "Notebook không tồn tại hoặc không có quyền truy cập")
+    # Kiểm tra notebook tồn tại và user có quyền truy cập
+    sb = get_supabase()
+    nb_check = await asyncio.to_thread(
+        lambda: sb.table("notebooks")
+        .select("id")
+        .eq("id", notebook_id)
+        .eq("user_id", uid)
+        .execute()
+    )
+    if not nb_check.data:
+        raise HTTPException(403, "Notebook không tồn tại hoặc không có quyền truy cập")
 
     doc_id = str(uuid.uuid4())
-    sb = get_supabase()
 
     chunks, page_count = extract_chunks(file_bytes, file.filename or "file.pdf")
     if not chunks:
         raise HTTPException(422, "Không trích xuất được nội dung từ file")
 
+    # Insert document với notebook_id (REQUIRED)
     await asyncio.to_thread(
         lambda: sb.table("documents").insert({
             "id": doc_id,
@@ -125,10 +132,11 @@ async def upload_document(
             "page_count": page_count,
             "type": ext,
             "status": "processing",
-            "notebook_id": notebook_id,
+            "notebook_id": notebook_id,  # luôn có giá trị
         }).execute()
     )
 
+    # Background task: embed chunks và lưu vào database với notebook context
     background_tasks.add_task(_embed_and_store, doc_id, uid, chunks, notebook_id)
 
     return {
@@ -142,14 +150,103 @@ async def upload_document(
 
 
 @router.get("")
-async def list_documents(user: dict = Depends(get_current_user)):
+async def list_documents(
+    notebook_id: Optional[str] = None,
+    user: dict = Depends(get_current_user)
+):
+    """Lấy danh sách documents của user.
+
+    Query params:
+    - notebook_id (optional): lọc theo notebook cụ thể
+    """
     uid = user["uid"]
     sb = get_supabase()
-    res = await asyncio.to_thread(
-        lambda: sb.table("documents")
-        .select("id, title, page_count, type, created_at, status, notebook_id")
+
+    # Xây dựng query
+    query = sb.table("documents") \
+        .select("id, title, page_count, type, created_at, status, notebook_id") \
         .eq("user_id", uid)
-        .order("created_at", desc=True)
-        .execute()
+
+    # Filter by notebook nếu được cung cấp
+    if notebook_id is not None:
+        if not _is_valid_uuid(notebook_id):
+            raise HTTPException(400, "notebook_id không hợp lệ (phải là UUID)")
+        query = query.eq("notebook_id", notebook_id)
+
+    # Execute
+    res = await asyncio.to_thread(
+        lambda: query.order("created_at", desc=True).execute()
     )
     return res.data or []
+
+
+# ── Assign existing documents to a notebook ──────────────────────────────────
+
+class AssignDocumentsRequest(BaseModel):
+    doc_ids: List[str]
+    notebook_id: str
+
+
+@router.post("/assign")
+async def assign_documents_to_notebook(
+    body: AssignDocumentsRequest,
+    user: dict = Depends(get_current_user),
+):
+    """Gán danh sách tài liệu đã upload vào một notebook cụ thể.
+
+    Cập nhật notebook_id cho cả documents lẫn chunks để RAG search vẫn hoạt động.
+    Chỉ cho phép gán documents thuộc chính user đang đăng nhập.
+    """
+    uid = user["uid"]
+
+    if not body.doc_ids:
+        raise HTTPException(400, "doc_ids không được rỗng")
+    if not _is_valid_uuid(body.notebook_id):
+        raise HTTPException(400, "notebook_id không hợp lệ (phải là UUID)")
+
+    # Validate tất cả doc_ids là UUID hợp lệ
+    for doc_id in body.doc_ids:
+        if not _is_valid_uuid(doc_id):
+            raise HTTPException(400, f"doc_id không hợp lệ: {doc_id}")
+
+    sb = get_supabase()
+
+    # Kiểm tra notebook tồn tại và thuộc user này
+    nb_check = await asyncio.to_thread(
+        lambda: sb.table("notebooks")
+        .select("id")
+        .eq("id", body.notebook_id)
+        .eq("user_id", uid)
+        .execute()
+    )
+    if not nb_check.data:
+        raise HTTPException(403, "Notebook không tồn tại hoặc không có quyền truy cập")
+
+    # Update documents: chỉ update docs thuộc user này (bảo mật)
+    assigned: List[str] = []
+    for doc_id in body.doc_ids:
+        result = await asyncio.to_thread(
+            lambda d=doc_id: sb.table("documents")
+            .update({"notebook_id": body.notebook_id})
+            .eq("id", d)
+            .eq("user_id", uid)
+            .execute()
+        )
+        if result.data:
+            assigned.append(doc_id)
+
+    # Cập nhật chunks để match_chunks_by_notebook RPC hoạt động đúng
+    for doc_id in assigned:
+        await asyncio.to_thread(
+            lambda d=doc_id: sb.table("chunks")
+            .update({"notebook_id": body.notebook_id})
+            .eq("document_id", d)
+            .eq("user_id", uid)
+            .execute()
+        )
+
+    return {
+        "assigned_count": len(assigned),
+        "assigned": assigned,
+        "notebook_id": body.notebook_id,
+    }
